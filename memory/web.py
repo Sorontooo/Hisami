@@ -7,8 +7,11 @@ the /prompt agentic search flow (router decision parsing, article
 extraction, fetched-content tiers).
 """
 
+import ipaddress
 import json
 import re
+import socket
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
@@ -16,6 +19,47 @@ V2_TEXT_BUDGET = 3800
 
 _URL_RE = re.compile(r"https?://[^\s<>\"]+")
 _TRAILING_PUNCT = ".,;:!?)'\"*`"
+
+
+def _strip_trailing(url):
+    """Strip trailing punctuation, keeping a ')' that closes a '(' in
+    the URL itself (e.g. wiki/Mercury_(planet))."""
+    while url and url[-1] in _TRAILING_PUNCT:
+        if url[-1] == ")" and url.count("(") >= url.count(")"):
+            break
+        url = url[:-1]
+    return url
+
+
+def is_public_url(url):
+    """True if url is http(s) and its host resolves only to public IPs.
+
+    Guards server-side fetches of user-supplied links against reaching
+    localhost, the LAN, or cloud metadata endpoints (private, loopback,
+    link-local, reserved, multicast, unspecified). Does DNS resolution
+    (blocking; run off the event loop). Never raises: anything
+    unparseable or unresolvable -> False.
+    """
+    try:
+        parts = urlparse(str(url or "").strip())
+        host = parts.hostname
+        if parts.scheme not in ("http", "https") or not host:
+            return False
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        if not infos:
+            return False
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            if ip.version == 6 and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast
+                    or ip.is_unspecified or not ip.is_global):
+                return False
+        return True
+    except Exception:
+        return False
 
 
 def extract_urls(text):
@@ -30,7 +74,7 @@ def extract_urls(text):
         return []
     out, seen = [], set()
     for raw in _URL_RE.findall(str(text)):
-        url = raw.rstrip(_TRAILING_PUNCT)
+        url = _strip_trailing(raw)
         if url and url not in seen:
             seen.add(url)
             out.append(url)

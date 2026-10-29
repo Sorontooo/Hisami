@@ -108,6 +108,15 @@ At minimum you'll need:
 * Discord bot token
 * OpenRouter API key
 
+To keep real tokens out of the tracked `config.json`, leave its
+placeholders and export them instead — non-empty env vars override the
+two config keys (also picked up by `style_profile.py` and `/reload`):
+
+```bash
+export DISCORD_TOKEN=...
+export OPENROUTER_API_KEY=...
+```
+
 Tunable groups (all have built-in defaults, see `config.json`):
 
 * `model` / `fallback_model` — main chat chain (local Ollama first, then OpenRouter)
@@ -359,7 +368,8 @@ venv/bin/python -m unittest discover -s tests -v
 
 Covers the `memory/` package (store, buffer, recall, facts, summaries,
 examples, log dump, style profile, vision) with stdlib `unittest` only.
-`bot.py` itself is not imported by tests.
+`bot.py` itself is not imported by tests. GitHub Actions runs the suite
+on every push and pull request (`.github/workflows/tests.yml`).
 
 ---
 

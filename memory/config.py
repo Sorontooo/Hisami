@@ -49,10 +49,36 @@ def strip_json_comments(text):
     return "".join(out)
 
 
+# Secrets that may come from the environment instead of config.json, so
+# the tracked file can keep its placeholders. A non-empty env var wins.
+SECRET_ENV_VARS = {
+    "discord_token": "DISCORD_TOKEN",
+    "openrouter_api_key": "OPENROUTER_API_KEY",
+}
+
+
+def apply_env_overrides(cfg, environ=None):
+    """Overlay SECRET_ENV_VARS from `environ` (default os.environ) onto cfg.
+
+    Mutates and returns cfg. Empty / whitespace-only values are ignored.
+    """
+    import os
+    environ = os.environ if environ is None else environ
+    for key, var in SECRET_ENV_VARS.items():
+        value = str(environ.get(var) or "").strip()
+        if value:
+            cfg[key] = value
+    return cfg
+
+
 def load_config(path="config.json"):
-    """Load config.json (or .jsonc-style content) into a dict."""
+    """Load config.json (or .jsonc-style content) into a dict.
+
+    Secrets in SECRET_ENV_VARS are overridden by matching env vars.
+    """
     with open(path, "r", encoding="utf-8") as f:
-        return json.loads(strip_json_comments(f.read()))
+        cfg = json.loads(strip_json_comments(f.read()))
+    return apply_env_overrides(cfg)
 
 
 def diff_configs(old, new):

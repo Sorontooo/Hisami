@@ -306,27 +306,48 @@ def get_max_msg_id(channel_id):
         con.close()
 
 
-def prune_channel(channel_id, keep=200):
-    """Keep only the newest `keep` messages. Returns rows deleted."""
+def prune_channel(channel_id, keep=200, protect_after=None, hard_cap=None):
+    """Keep the newest `keep` messages. Returns message rows deleted.
+
+    protect_after: if set, rows with msg_id > protect_after (i.e. not yet
+    summarized) are spared, so pruning never discards history before it
+    reaches long-term memory. hard_cap: if set, the newest hard_cap rows
+    are kept regardless, bounding channels whose backlog never gets
+    summarized (e.g. paused for lack of bot mentions).
+    """
     con = _connect()
     try:
-        con.execute(
-            """DELETE FROM messages WHERE channel_id=?
-               AND msg_id NOT IN (
-                   SELECT msg_id FROM messages WHERE channel_id=?
-                   ORDER BY msg_id DESC LIMIT ?
-               )""",
-            (str(channel_id), str(channel_id), int(keep)),
-        )
+        ch = str(channel_id)
+        newest = """SELECT msg_id FROM messages WHERE channel_id=?
+                    ORDER BY msg_id DESC LIMIT ?"""
+        if protect_after is None:
+            cur = con.execute(
+                f"""DELETE FROM messages WHERE channel_id=?
+                    AND msg_id NOT IN ({newest})""",
+                (ch, ch, int(keep)),
+            )
+        else:
+            cur = con.execute(
+                f"""DELETE FROM messages WHERE channel_id=?
+                    AND msg_id <= ? AND msg_id NOT IN ({newest})""",
+                (ch, int(protect_after), ch, int(keep)),
+            )
+        deleted = max(cur.rowcount, 0)
+        if hard_cap is not None:
+            cur = con.execute(
+                f"""DELETE FROM messages WHERE channel_id=?
+                    AND msg_id NOT IN ({newest})""",
+                (ch, ch, max(int(hard_cap), int(keep))),
+            )
+            deleted += max(cur.rowcount, 0)
         # sync FTS: drop orphan entries
         con.execute(
             """DELETE FROM messages_fts WHERE channel_id=?
                AND msg_id NOT IN (
                    SELECT msg_id FROM messages WHERE channel_id=?
                )""",
-            (str(channel_id), str(channel_id)),
+            (ch, ch),
         )
-        deleted = con.total_changes
         con.commit()
         return deleted
     finally:

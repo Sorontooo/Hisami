@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime / debug output (logs contain full prompts and conversation text)
+logs/
+memory.db
+memory.db-wal
+memory.db-shm
+memory.db-journal
+
+# Personal chat data and derived artifacts (built locally, never shared)
+export.json
+dataset.jsonl
+index.bin
+texts.json
+style_profile.txt
+# partial saves left by an interrupted embed.py
+*.tmp
+
+# Local secrets (see DISCORD_TOKEN / OPENROUTER_API_KEY in README)
+.env
+.github_pat

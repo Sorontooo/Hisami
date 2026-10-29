@@ -132,6 +132,35 @@ class StoreTest(TempDBMixin, unittest.TestCase):
         self.assertEqual(mem_store.get_messages_before("cc", "bad", 3), [])
         self.assertEqual(mem_store.get_messages_before("other", 4, 3), [])
 
+    def test_prune_channel(self):
+        self._seed("cp", 100)
+        self._seed("other", 5)
+        # plain prune keeps the newest `keep`, count is message rows only
+        self.assertEqual(mem_store.prune_channel("cp", keep=60), 40)
+        self.assertEqual(mem_store.get_message_count("cp"), 60)
+        self.assertEqual(mem_store.get_message_count("other"), 5)
+        # FTS stays in sync with the surviving rows
+        import sqlite3
+        con = sqlite3.connect(self.path)
+        try:
+            ids = [r[0] for r in con.execute(
+                "SELECT msg_id FROM messages_fts WHERE channel_id='cp'")]
+        finally:
+            con.close()
+        self.assertEqual(sorted(int(i) for i in ids), list(range(41, 101)))
+
+    def test_prune_spares_unsummarized(self):
+        self._seed("cu", 100)
+        # only 1..20 summarized: 21..100 survive despite keep=10
+        self.assertEqual(
+            mem_store.prune_channel("cu", keep=10, protect_after=20), 20)
+        self.assertEqual(mem_store.get_message_count("cu"), 80)
+        # hard cap still bounds a backlog that never gets summarized
+        mem_store.prune_channel("cu", keep=10, protect_after=20, hard_cap=50)
+        rows = mem_store.get_recent("cu", limit=200)
+        self.assertEqual(len(rows), 50)
+        self.assertEqual(min(r["msg_id"] for r in rows), 51)
+
     def test_clear_recent_keeps_summaries_and_facts(self):
         self._seed(n=10)
         mem_store.add_summary("c1", "talked about minecraft", 1, 5)
@@ -758,6 +787,30 @@ class RecallTest(TempDBMixin, unittest.TestCase):
             "cx", "minecraft skyblock", exclude_ids={1})
         self.assertTrue(hits)
         self.assertTrue(all(h["msg_id"] != 1 for h in hits))
+
+    def test_search_messages_exclusion_does_not_starve(self):
+        # Regression: exclusion ran after LIMIT limit*3, so a live window
+        # full of top hits returned nothing despite older matches.
+        for i in range(1, 41):
+            mem_store.add_message("cs", i, "u1", "alice", "user",
+                                  f"old story {i} about pizza toppings")
+        window = set(range(41, 61))
+        for i in window:
+            mem_store.add_message("cs", i, "u1", "alice", "user", "pizza")
+        hits = mem_recall.search_messages(
+            "cs", "pizza", limit=5, exclude_ids=window)
+        self.assertEqual(len(hits), 5)
+        self.assertTrue(all(h["msg_id"] not in window for h in hits))
+        # string ids (as callers may pass) exclude the same rows
+        hits = mem_recall.search_messages(
+            "cs", "pizza", limit=5, exclude_ids={str(i) for i in window})
+        self.assertTrue(all(h["msg_id"] not in window for h in hits))
+        # huge exclusion sets fall back to over-fetch, still correct
+        big = set(range(41, 61)) | set(range(10_000, 11_000))
+        hits = mem_recall.search_messages(
+            "cs", "pizza", limit=5, exclude_ids=big)
+        self.assertEqual(len(hits), 5)
+        self.assertTrue(all(h["msg_id"] not in big for h in hits))
 
     def test_select_recall_chronological_and_filtered(self):
         recalled = [
@@ -1454,6 +1507,22 @@ class VisionTest(unittest.TestCase):
         out = Image.open(_io.BytesIO(small))
         self.assertEqual(out.format, "JPEG")
         self.assertLessEqual(max(out.size), 512)
+
+    def test_downscale_flattens_transparency_onto_white(self):
+        # Regression: convert("RGB") dropped alpha, so transparent
+        # stickers/logos reached the vision model as solid black.
+        from PIL import Image
+        import io as _io
+        rgba = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        pal = Image.new("P", (64, 64), 0)
+        pal.putpalette([0, 0, 0] * 256)
+        pal.info["transparency"] = 0
+        for img in (rgba, pal):
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            out = Image.open(_io.BytesIO(mem_vision.downscale(buf.getvalue())))
+            r, g, b = out.convert("RGB").getpixel((32, 32))
+            self.assertGreater(min(r, g, b), 240, img.mode)
         self.assertGreater(max(out.size), 0)
 
     def test_cache_key_stable(self):
@@ -1520,6 +1589,24 @@ class ConfigTest(unittest.TestCase):
         for key in ("discord_token", "model", "ollama_model",
                     "memory_db_path", "summary_model", "vision_model"):
             self.assertIn(key, cfg)
+
+    def test_env_overrides_secrets(self):
+        cfg = {"discord_token": "placeholder", "openrouter_api_key": "p",
+               "model": "m"}
+        env = {"DISCORD_TOKEN": " real-token ", "OPENROUTER_API_KEY": "",
+               "MODEL": "ignored"}
+        out = mem_config.apply_env_overrides(cfg, env)
+        # non-empty env var wins (trimmed), mutates in place
+        self.assertIs(out, cfg)
+        self.assertEqual(cfg["discord_token"], "real-token")
+        # empty env var leaves the config value alone
+        self.assertEqual(cfg["openrouter_api_key"], "p")
+        # only the listed secrets are overridable
+        self.assertEqual(cfg["model"], "m")
+        # missing key gets filled from env
+        self.assertEqual(
+            mem_config.apply_env_overrides({}, {"OPENROUTER_API_KEY": "k"}),
+            {"openrouter_api_key": "k"})
 
     def test_ollama_base(self):
         base = mem_config.ollama_base

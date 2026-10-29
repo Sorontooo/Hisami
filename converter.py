@@ -58,6 +58,11 @@ def load_messages_safe(path):
 
 messages = load_messages_safe(INPUT_FILE)
 
+# Reply targets are looked up against the raw export: merging drops
+# attachment-only posts and every fragment id but the first, so a map
+# built after merging labels most replies "standalone".
+known_ids = {m.get("id") for m in messages if "id" in m}
+
 # ==========================
 # MERGE SPLIT MESSAGES
 # ==========================
@@ -69,7 +74,7 @@ def merge_messages(messages):
 
     for msg in messages:
 
-        content = msg.get("content", "").strip()
+        content = (msg.get("content") or "").strip()
         if not content:
             continue
 
@@ -79,6 +84,9 @@ def merge_messages(messages):
             and msg["timestamp"][:16] == buffer["timestamp"][:16]
         ):
             buffer["content"] += " " + content
+            # keep a reply reference carried by a later fragment
+            if not buffer.get("reference") and msg.get("reference"):
+                buffer["reference"] = msg["reference"]
         else:
             if buffer:
                 merged.append(buffer)
@@ -93,17 +101,11 @@ def merge_messages(messages):
 messages = merge_messages(messages)
 
 # ==========================
-# MAP IDS
-# ==========================
-
-msg_map = {m.get("id"): m for m in messages if "id" in m}
-
-# ==========================
 # HELPERS
 # ==========================
 
 def clean_content(msg):
-    return msg.get("content", "").strip()
+    return (msg.get("content") or "").strip()
 
 def build_context(index):
     ctx = []
@@ -151,7 +153,7 @@ with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         if msg.get("reference") and msg["reference"].get("messageId"):
             ref_id = msg["reference"]["messageId"]
 
-            if ref_id in msg_map:
+            if ref_id in known_ids:
                 is_reply = True
 
         entry = {

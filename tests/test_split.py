@@ -74,6 +74,35 @@ class SplitTest(unittest.TestCase):
         self.assertEqual("".join(parts)[:5999], "z" * 5999)
         self.assertTrue(parts[-1].endswith("…"))
 
+    def test_big_codeblock_no_wasted_parts_no_loss(self):
+        # Regression: the only out-of-fence newline sat right before the
+        # opening fence, so part 1 was just "Here:" and fence repair
+        # trimmed code mid-reply until the outro fell off the cap.
+        lines = [f"line_{i:04d} = compute(value_{i})" for i in range(150)]
+        text = "Here:\n```python\n" + "\n".join(lines) + "\n```\ndone"
+        self.assertLess(len(text), 3 * 2000)
+        parts = mem_split.split_message(text, limit=2000, max_parts=3)
+        self.assertGreater(len(parts[0]), 1000)
+        for p in parts:
+            self.assertLessEqual(len(p), 2000)
+            self.assertTrue(balanced(p))
+        joined = "\n".join(parts)
+        for line in lines:
+            self.assertIn(line, joined)
+        self.assertTrue(parts[-1].endswith("done"))
+        self.assertNotIn("…", joined)
+
+    def test_reopened_chunk_budget_reserved(self):
+        # A long fenced block spanning several chunks loses nothing.
+        body = "\n".join("x" * 50 + str(i) for i in range(50))
+        text = "```\n" + body + "\n```"
+        parts = mem_split.split_message(text, limit=500, max_parts=10)
+        for p in parts:
+            self.assertLessEqual(len(p), 500)
+            self.assertTrue(balanced(p))
+        stripped = "\n".join(parts).replace("```", "").split()
+        self.assertEqual(stripped, body.split())
+
     def test_garbage_input_never_crashes(self):
         self.assertTrue(mem_split.split_message(None))
         self.assertTrue(mem_split.split_message(12345))

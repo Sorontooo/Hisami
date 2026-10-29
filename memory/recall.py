@@ -197,6 +197,9 @@ def split_recent_relevant(items, limit, time_key="updated_at", id_key=None,
     return recent + relevant
 
 
+_MAX_SQL_EXCLUDE = 500
+
+
 def search_messages(channel_id, query, limit=5, exclude_ids=None):
     """Return up to `limit` past messages relevant to query.
 
@@ -210,6 +213,19 @@ def search_messages(channel_id, query, limit=5, exclude_ids=None):
     if not tokens:
         return []
     excluded = {str(x) for x in (exclude_ids or ())}
+    # Exclude in SQL so a window full of top hits can't starve recall of
+    # older matches. Past SQLite's bound-variable limit, over-fetch and
+    # filter in Python instead.
+    if len(excluded) <= _MAX_SQL_EXCLUDE:
+        not_in = (f" AND msg_id NOT IN ({','.join('?' * len(excluded))})"
+                  if excluded else "")
+        # FTS5 columns have no affinity: bind ints so 1 != '1' can't slip.
+        ex_params = [int(x) if x.lstrip("-").isdigit() else x
+                     for x in excluded]
+        fetch = int(limit) * 3
+    else:
+        not_in, ex_params = "", []
+        fetch = int(limit) * 3 + len(excluded)
     con = sqlite3.connect(store.DB_PATH, timeout=10)
     con.row_factory = sqlite3.Row
     try:
@@ -219,9 +235,9 @@ def search_messages(channel_id, query, limit=5, exclude_ids=None):
                           rank AS score
                    FROM messages_fts
                    WHERE messages_fts MATCH ?
-                     AND channel_id = ?
+                     AND channel_id = ?""" + not_in + """
                    ORDER BY rank LIMIT ?""",
-                (_fts_query(tokens), str(channel_id), int(limit) * 3),
+                (_fts_query(tokens), str(channel_id), *ex_params, fetch),
             ).fetchall()
             # FTS5 rank: more negative = better. Normalize for display.
             out = []
@@ -245,9 +261,9 @@ def search_messages(channel_id, query, limit=5, exclude_ids=None):
         params = [f"%{t}%" for t in tokens]
         rows = con.execute(
             f"""SELECT channel_id, msg_id, author_name, content, 0.0 AS score
-                FROM messages WHERE channel_id=? AND ({likes})
+                FROM messages WHERE channel_id=? AND ({likes}){not_in}
                 ORDER BY msg_id DESC LIMIT ?""",
-            (str(channel_id), *params, int(limit) * 3),
+            (str(channel_id), *params, *ex_params, fetch),
         ).fetchall()
         return [dict(r) for r in rows
                 if str(r["msg_id"]) not in excluded][:int(limit)]

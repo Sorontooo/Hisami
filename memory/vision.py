@@ -72,6 +72,12 @@ def downscale(image_bytes, max_side=MAX_SIDE):
     Raises on undecodable input (callers treat as fail-soft).
     """
     with Image.open(io.BytesIO(image_bytes)) as img:
+        if img.mode in ("RGBA", "LA", "PA") or (
+                img.mode == "P" and "transparency" in img.info):
+            # convert("RGB") would just drop alpha (transparent -> black)
+            rgba = img.convert("RGBA")
+            img = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            img.alpha_composite(rgba)
         img = img.convert("RGB")
         img.thumbnail((max_side, max_side), Image.LANCZOS)
         buf = io.BytesIO()

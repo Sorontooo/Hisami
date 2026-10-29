@@ -432,6 +432,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RETRIES = 5       # OpenRouter attempts per model
 REQUEST_TIMEOUT = 120  # seconds per OpenRouter request
 RETRYABLE_CODES = (429, 502, 503, 504)
+# Unsummarized rows survive pruning up to memory_prune_keep x this factor.
+MEMORY_PRUNE_HARD_CAP_FACTOR = 4
 
 RETRIEVAL_TEMPERATURE = 0.30
 # 0.0 = deterministic
@@ -541,7 +543,12 @@ def add_message(channel_id, message_id, author, role, content, reply_to=None,
     # prune runs inside to_thread callers; keep it cheap: prune async occasionally
     try:
         if mem_store.get_message_count(channel_id) > MEMORY_PRUNE_KEEP + 20:
-            mem_store.prune_channel(channel_id, keep=MEMORY_PRUNE_KEEP)
+            # Spare not-yet-summarized rows (summaries can lag behind a
+            # busy channel or an offline model) up to a hard cap.
+            mem_store.prune_channel(
+                channel_id, keep=MEMORY_PRUNE_KEEP,
+                protect_after=mem_store.get_last_summary_upto(channel_id),
+                hard_cap=MEMORY_PRUNE_KEEP * MEMORY_PRUNE_HARD_CAP_FACTOR)
     except Exception:
         log.exception("prune failed")
 
@@ -627,7 +634,10 @@ def keyword_search(search_text, k):
     return results[:k]
 
 
-def retrieve_examples(channel_id, user_message, limit=MAX_EXAMPLES):
+def retrieve_examples(channel_id, user_message, limit=None):
+    # Resolve at call time so /reload of max_examples takes effect.
+    if limit is None:
+        limit = MAX_EXAMPLES
     if not indexed_texts:
         return []
 
@@ -806,12 +816,15 @@ def _web_search_once(query, max_results):
     return "ok", _parse_html_results(r.text, max_results)
 
 
-def web_search(query, max_results=SEARCH_MAX_RESULTS):
+def web_search(query, max_results=None):
     """Blocking — call from async code with asyncio.to_thread().
 
     Retries transport/parse failures (e.g. connection resets) up to
     SEARCH_MAX_RETRIES total attempts. Bot-blocks are NOT retried.
+    max_results defaults to the live SEARCH_MAX_RESULTS (reloadable).
     """
+    if max_results is None:
+        max_results = SEARCH_MAX_RESULTS
     for attempt in range(1, SEARCH_MAX_RETRIES + 1):
         try:
             status, results = _web_search_once(query, max_results)
@@ -851,28 +864,36 @@ def clean_for_search(text):
     return text.strip()
 
 
-def build_web_query(channel_id, user_message):
+def build_web_query(channel_id, user_message, current_message_id=None):
     """
     Normally search the raw user message only.
 
     Short follow-ups like "is that real?" have no subject on
     their own, so we prepend the previous message in that case.
+    Blocking (SQLite) — call via asyncio.to_thread().
 
-    NOTE: by the time this runs, the current message has ALREADY
-    been appended to history in on_message, so [-2:-1] is the
-    *previous* message, not the current one.
+    The current message may already be in history (on_message stores it
+    first); it is kept out of fragment merges and skipped explicitly so
+    "previous" really is the message before it.
     """
+    cleaned = clean_for_search(user_message)
     if len(user_message.split()) <= SEARCH_SHORT_MESSAGE_WORDS:
-        prev = _history_compat(channel_id)[-2:-1]
+        history = _history_compat(channel_id, current_message_id)
+        if current_message_id is not None:
+            history = [m for m in history
+                       if current_message_id not in (m.get("ids") or [])]
+        else:
+            # Legacy assumption: the last entry is the current message.
+            history = history[:-1]
 
-        if prev:
-            prev_text = clean_for_search(prev[0]["content"])[:120]
-            return f"{prev_text} {user_message}".strip()
+        if history:
+            prev_text = clean_for_search(history[-1]["content"])[:120]
+            return f"{prev_text} {cleaned}".strip()
 
-    return clean_for_search(user_message)
+    return cleaned
 
 
-async def get_web_context(channel_id, user_message):
+async def get_web_context(channel_id, user_message, current_message_id=None):
     """
     Returns a formatted prompt section, or '' if no search
     should happen / nothing was found.
@@ -880,7 +901,8 @@ async def get_web_context(channel_id, user_message):
     if not SEARCH_ENABLED or not should_search(user_message):
         return ""
 
-    query = build_web_query(channel_id, user_message)
+    query = await asyncio.to_thread(
+        build_web_query, channel_id, user_message, current_message_id)
     log.info("[search] %r", query)
 
     results = await asyncio.to_thread(web_search, query)
@@ -1100,7 +1122,8 @@ async def build_messages(channel_id, user_message, username, author_id="",
     message that actually carried the image. The window is loaded first
     so recall can exclude messages already in context.
     """
-    history = _history_compat(channel_id, current_message_id)
+    history = await asyncio.to_thread(
+        _history_compat, channel_id, current_message_id)
     exclude_ids = {m["id"] for m in history}
     exclude_ids.update(i for m in history for i in (m.get("ids") or []))
     if current_message_id is not None:
@@ -1114,7 +1137,7 @@ async def build_messages(channel_id, user_message, username, author_id="",
         asyncio.to_thread(retrieve_examples, channel_id, user_message),
         asyncio.to_thread(retrieve_examples, channel_id, user_message,
                           MAX_EXAMPLES + STYLE_EXAMPLES_POOL),
-        get_web_context(channel_id, user_message),
+        get_web_context(channel_id, user_message, current_message_id),
         get_memory_context(channel_id, user_message, author_id, username,
                            reply_block, exclude_ids, bot_id, bot_name),
     )
@@ -1409,10 +1432,16 @@ async def ollama_chat(messages, model=None, temperature=0.9,
     return None
 
 
+RETRY_AFTER_MAX = 30.0
+
+
 def _retry_delay(attempt, retry_after=None):
+    # Honor Retry-After, capped: callers hold the channel lock meanwhile.
     if retry_after:
         try:
-            return float(retry_after)
+            delay = float(retry_after)
+            if 0 <= delay < float("inf"):
+                return min(delay, RETRY_AFTER_MAX)
         except ValueError:
             pass
 
@@ -1425,6 +1454,18 @@ def _openrouter_provider_for(model):
     Delegates to the pure config helper; [] when unrestricted.
     """
     return mem_config.provider_order_for(model, OPENROUTER_PROVIDERS)
+
+
+FALLBACK_TAG_PREFIX = "-# [fallback: "
+
+
+def strip_fallback_tag(reply):
+    """Drop the display-only fallback tag before a reply enters history,
+    so the model never sees (and imitates) it in its own past turns."""
+    text = str(reply or "")
+    if text.startswith(FALLBACK_TAG_PREFIX):
+        _, _, text = text.partition("\n")
+    return text
 
 
 async def openrouter_chat(messages, model, tag_as_fallback=False,
@@ -1514,16 +1555,24 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
         error = data.get("error") if isinstance(data, dict) else None
 
         # OpenRouter sometimes returns HTTP 200 with an embedded error.
+        # HTTP 429s land here too ({"error": {"code": 429, ...}}).
         if error:
+            if not isinstance(error, dict):
+                error = {"message": str(error)}
             code = error.get("code")
-            message = error.get("message", "")
+            message = str(error.get("message", ""))
 
             log.warning("[%s] Embedded OpenRouter error (%s): %s",
                         model, code, message)
 
+            # Daily free quota exhausted: retrying can't help today.
+            if "free-models-per-day" in message:
+                log.warning("[%s] Daily free quota exhausted.", model)
+                return None
+
             # Treat temporary upstream failures as retryable.
             if code in RETRYABLE_CODES and attempt < retries:
-                delay = _retry_delay(attempt)
+                delay = _retry_delay(attempt, r.headers.get("Retry-After"))
                 log.warning(
                     "[%s] Temporary error %s → retry %d/%d in %.2fs",
                     model, code, attempt, retries, delay,
@@ -1542,7 +1591,7 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
                 return None
 
             if tag_as_fallback:
-                reply = f"-# [fallback: {model}]\n{reply}"
+                reply = f"{FALLBACK_TAG_PREFIX}{model}]\n{reply}"
 
             log.info("[%s] Request succeeded.", model)
             if debug_key is not None:
@@ -1553,13 +1602,6 @@ async def openrouter_chat(messages, model, tag_as_fallback=False,
             return reply
 
         if r.status_code in RETRYABLE_CODES:
-            message = error.get("message", "") if error else ""
-
-            # Don't retry if the daily free quota is exhausted
-            if "free-models-per-day" in message:
-                log.warning("[%s] Daily free quota exhausted.", model)
-                return None
-
             if attempt < retries:
                 delay = _retry_delay(attempt, r.headers.get("Retry-After"))
                 log.warning(
@@ -1675,18 +1717,72 @@ def _vision_log_payload(payload):
     return red
 
 
+FETCH_MAX_REDIRECTS = 5
+
+
+class _FetchRejected(Exception):
+    """fetch_capped refused a URL / response (reason in the message)."""
+
+
+def fetch_capped(url, timeout, max_bytes, accept_ctype, headers=None):
+    """Blocking: GET url, return (body_bytes, response). Raises on refusal.
+
+    Hardened for user-supplied URLs:
+    * every hop (redirects followed manually) must resolve to a public
+      address (mem_web.is_public_url), so a pasted link or a redirect
+      can't reach localhost / LAN services such as the Ollama API;
+    * Content-Type is checked from headers before reading the body;
+    * the body is streamed and abandoned once it passes max_bytes
+      (Content-Length is checked up front when present);
+    * `timeout` also bounds the whole download, not just each read.
+    """
+    deadline = time.monotonic() + timeout
+    for _ in range(FETCH_MAX_REDIRECTS + 1):
+        if not mem_web.is_public_url(url):
+            raise _FetchRejected(f"non-public address: {url}")
+        r = http.get(url, timeout=timeout, headers=headers, stream=True,
+                     allow_redirects=False)
+        try:
+            if r.is_redirect:
+                nxt = r.headers.get("Location", "")
+                url = requests.compat.urljoin(url, nxt)
+                continue
+            if r.status_code != 200:
+                raise _FetchRejected(f"HTTP {r.status_code}")
+            ctype = r.headers.get("Content-Type", "")
+            if not accept_ctype(ctype):
+                raise _FetchRejected(f"content-type {ctype!r}")
+            try:
+                declared = int(r.headers.get("Content-Length") or 0)
+            except ValueError:
+                declared = 0
+            if declared > max_bytes:
+                raise _FetchRejected(f"over size cap ({declared} bytes)")
+            body = bytearray()
+            for chunk in r.iter_content(64 * 1024):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise _FetchRejected("over size cap")
+                if time.monotonic() > deadline:
+                    raise _FetchRejected("download deadline exceeded")
+            if not body:
+                raise _FetchRejected("empty body")
+            return bytes(body), r
+        finally:
+            r.close()
+    raise _FetchRejected("too many redirects")
+
+
 def download_image(url):
     """Blocking: fetch raw bytes if the URL serves an image. Else None."""
     try:
-        r = http.get(url, timeout=30)
-        if r.status_code != 200 or not r.content:
-            return None
-        if not r.headers.get("Content-Type", "").startswith("image/"):
-            return None
-        if len(r.content) > VISION_MAX_BYTES:
-            log.warning("[vision] image over size cap, skipping")
-            return None
-        return r.content
+        body, _ = fetch_capped(
+            url, 30, VISION_MAX_BYTES,
+            lambda ctype: ctype.startswith("image/"))
+        return body
+    except _FetchRejected as e:
+        log.warning("[vision] skipping image: %s", e)
+        return None
     except Exception:
         return None
 
@@ -1999,19 +2095,31 @@ def fetch_page(url, timeout=None, max_bytes=None):
     if max_bytes is None:
         max_bytes = PROMPT_FETCH_MAX_BYTES
     try:
-        r = http.get(url, timeout=timeout, headers=FETCH_HEADERS)
-        if r.status_code != 200 or not r.content:
-            return None
-        ctype = r.headers.get("Content-Type", "")
-        if "html" not in ctype and "text" not in ctype:
-            return None
-        if len(r.content) > max_bytes:
-            log.info("[prompt-fetch] %s over size cap, skipping", url)
-            return None
-        return r.content.decode(r.encoding or "utf-8", errors="replace")
+        body, r = fetch_capped(
+            url, timeout, max_bytes,
+            lambda ctype: "html" in ctype or "text" in ctype,
+            headers=FETCH_HEADERS)
+        return body.decode(r.encoding or "utf-8", errors="replace")
+    except _FetchRejected as e:
+        log.info("[prompt-fetch] %s skipped: %s", url, e)
+        return None
     except Exception as e:
         log.debug("[prompt-fetch] %s failed: %s", url, e)
         return None
+
+
+def fetch_article(url):
+    """Blocking: fetch_page + article extraction, '' on any failure.
+
+    Both halves are slow (network, then BeautifulSoup on up to
+    PROMPT_FETCH_MAX_BYTES of HTML), so callers run the pair in one
+    asyncio.to_thread() instead of parsing on the event loop.
+    """
+    html = fetch_page(url)
+    if not html:
+        return ""
+    text = mem_web.extract_article_text(html, max_chars=PROMPT_FETCH_CHARS)
+    return text if str(text or "").strip() else ""
 
 
 async def router_generate(query, history_text=""):
@@ -2087,19 +2195,12 @@ async def fetch_linked_pages(query):
         cap = 2
     urls = urls[:cap]
     try:
-        pages = await asyncio.gather(*[
-            asyncio.to_thread(fetch_page, u) for u in urls])
+        texts = await asyncio.gather(*[
+            asyncio.to_thread(fetch_article, u) for u in urls])
     except Exception:
         log.exception("[prompt] linked page fetch failed")
         return {}
-    contents = {}
-    for url, html in zip(urls, pages):
-        if not html:
-            continue
-        text = mem_web.extract_article_text(
-            html, max_chars=PROMPT_FETCH_CHARS)
-        if str(text or "").strip():
-            contents[url] = text
+    contents = {url: text for url, text in zip(urls, texts) if text}
     if contents:
         log.info("[prompt] fetched %d linked page(s)", len(contents))
     return contents
@@ -2160,15 +2261,10 @@ async def run_prompt_search(query, history_text=""):
         urls = [r["url"] for r in results[:fcap]
                 if r.get("url") and r["url"] not in linked]
         if urls:
-            pages = await asyncio.gather(*[
-                asyncio.to_thread(fetch_page, u) for u in urls])
-            for url, html in zip(urls, pages):
-                if not html:
-                    continue
-                text = mem_web.extract_article_text(
-                    html, max_chars=PROMPT_FETCH_CHARS)
-                if str(text or "").strip():
-                    contents[url] = text
+            texts = await asyncio.gather(*[
+                asyncio.to_thread(fetch_article, u) for u in urls])
+            contents.update(
+                (url, text) for url, text in zip(urls, texts) if text)
             log.info("[prompt] fetched %d/%d pages",
                      len(contents), len(urls))
     prompt_text = build_web_prompt(query, results, contents or None,
@@ -2322,15 +2418,23 @@ class ContinuePromptModal(discord.ui.Modal):
             return
 
         conversation["generating"] = True
-        await interaction.response.defer()
-
-        # Disable BOTH Continue buttons on the original message.
-        self.prompt_view.disable_continue_buttons()
-
-        if self.prompt_view.message is not None:
-            await self.prompt_view.message.edit(view=self.prompt_view)
-
         try:
+            await interaction.response.defer()
+
+            # Disable BOTH Continue buttons on the original message.
+            # Best-effort: the edit goes through the original interaction
+            # token, which expires after 15 min while the view lives
+            # longer — a failed cosmetic edit must not abort the turn
+            # (or, outside this try, strand `generating` forever).
+            self.prompt_view.disable_continue_buttons()
+            if self.prompt_view.message is not None:
+                try:
+                    await self.prompt_view.message.edit(
+                        view=self.prompt_view)
+                except Exception as e:
+                    log.warning("[prompt] could not disable Continue "
+                                "buttons: %s", e)
+
             conversation["last_activity"] = time.time()
 
             user_message = self.message_input.value
@@ -2369,7 +2473,7 @@ class ContinuePromptModal(discord.ui.Modal):
 
             conversation["messages"].append({
                 "role": "assistant",
-                "content": reply,
+                "content": strip_fallback_tag(reply),
             })
             conversation["last_response"] = reply
             conversation["last_activity"] = time.time()
@@ -3068,7 +3172,19 @@ async def reload_config_cmd(interaction: discord.Interaction):
             await interaction.followup.send(
                 "No changes — config is already current.")
             return
-        apply_config(new)
+        # apply_config assigns globals one by one, so a missing required
+        # key would leave a half-applied mix. Re-apply the old dict (known
+        # good) on failure so the bot really keeps the old config.
+        old = config
+        try:
+            apply_config(new)
+        except Exception as e:
+            log.exception("[bot] reload apply failed, restoring old config")
+            apply_config(old)
+            await interaction.followup.send(
+                f"config.json is invalid, old config kept: "
+                f"{type(e).__name__}: {e}")
+            return
         needs_restart = sorted(set(changed) & RESTART_REQUIRED_KEYS)
         live = sorted(set(changed) - RESTART_REQUIRED_KEYS)
         # bot_status may have changed — re-apply presence
@@ -3197,7 +3313,7 @@ async def prompt_command(
             "messages": messages + [
                 {
                     "role": "assistant",
-                    "content": reply,
+                    "content": strip_fallback_tag(reply),
                 }
             ],
 
@@ -3255,12 +3371,16 @@ async def web_command(
         await interaction.followup.send("Search failed, try again later 💀")
         return
 
+    # Slash-command strings can run to 6000 chars; the heading shares the
+    # message's text budget with up to V2_TEXT_BUDGET of results.
+    shown = query if len(query) <= 100 else query[:99] + "…"
+
     if not results:
-        await interaction.followup.send(f"No results found for: {query}")
+        await interaction.followup.send(f"No results found for: {shown}")
         return
 
     container = discord.ui.Container()
-    container.add_item(discord.ui.TextDisplay(f"## 🌐 {query}"))
+    container.add_item(discord.ui.TextDisplay(f"## 🌐 {shown}"))
     container.add_item(
         discord.ui.TextDisplay(mem_web.format_web_results(results[:count])))
 
@@ -3272,7 +3392,13 @@ async def web_command(
 
 @client.event
 async def on_ready():
-    await tree.sync()
+    # A failed sync (transient HTTP error, missing applications.commands
+    # scope) must not skip the background tasks below; on_ready fires
+    # again on reconnect and retries it.
+    try:
+        await tree.sync()
+    except Exception:
+        log.exception("[bot] slash command sync failed")
 
     status = BOT_STATUS_MAP.get(str(BOT_STATUS).lower(), discord.Status.online)
     if str(BOT_STATUS).lower() not in BOT_STATUS_MAP:
@@ -3400,7 +3526,10 @@ async def on_message(message):
                             _history_compat, message.channel.id)
                         reply_block = await build_reply_context_block(
                             message.channel.id, message, reply_target,
-                            {m["id"] for m in window},
+                            # every fragment id of merged entries, as in
+                            # build_messages (m["id"] is only the last)
+                            {i for m in window
+                             for i in (m.get("ids") or [m["id"]])},
                             str(client.user.id) if client.user else "",
                             ASSISTANT_NAME)
                     except Exception:
@@ -3470,7 +3599,7 @@ async def on_message(message):
                     sent.id,
                     ASSISTANT_NAME,
                     "assistant",
-                    reply,
+                    strip_fallback_tag(reply),
                     message.id,
                     str(client.user.id) if client.user else "assistant",
                     None,

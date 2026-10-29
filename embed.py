@@ -1,4 +1,7 @@
 import json
+import os
+import sys
+
 import requests
 import numpy as np
 import hnswlib
@@ -22,6 +25,13 @@ TEXTS_FILE = "texts.json"
 
 DIM = 768  # nomic embedding size
 
+# Refuse to overwrite a good index with a partial one: abort (writing
+# nothing) when more than this share of records fail to embed, or after
+# this many failures in a row (Ollama went away mid-run).
+MAX_SKIP_RATIO = 0.10
+MAX_CONSECUTIVE_FAILURES = 25
+REQUEST_TIMEOUT = 60
+
 # HNSW params (safe defaults)
 M = 16
 EF_CONSTRUCTION = 200
@@ -36,7 +46,8 @@ def get_embedding(text):
         json={
             "model": EMBED_MODEL,
             "input": text
-        }
+        },
+        timeout=REQUEST_TIMEOUT,
     )
     res.raise_for_status()
     return res.json()["embeddings"][0]
@@ -85,9 +96,12 @@ def main():
 
     total = 0
     skipped = 0
+    consecutive = 0
 
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         for line in tqdm(f, desc="Building index"):
+            if not line.strip():
+                continue
             record = json.loads(line)
 
             text = build_text(record)
@@ -98,11 +112,25 @@ def main():
                 embeddings.append(emb)
                 texts.append(text)
                 total += 1
+                consecutive = 0
 
             except Exception as e:
                 print(f"Error embedding: {e}")
                 skipped += 1
+                consecutive += 1
+                if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                    sys.exit(f"Aborting: {consecutive} embeddings failed in a "
+                             f"row (is Ollama running at {OLLAMA_URL}?). "
+                             f"Existing {INDEX_FILE}/{TEXTS_FILE} untouched.")
                 continue
+
+    if not embeddings:
+        sys.exit(f"Aborting: nothing embedded ({skipped} failed). "
+                 f"Existing {INDEX_FILE}/{TEXTS_FILE} untouched.")
+    if skipped > MAX_SKIP_RATIO * (total + skipped):
+        sys.exit(f"Aborting: {skipped}/{total + skipped} embeddings failed "
+                 f"(> {MAX_SKIP_RATIO:.0%}). Fix the errors above and rerun; "
+                 f"existing {INDEX_FILE}/{TEXTS_FILE} untouched.")
 
     # ===== BUILD INDEX =====
     print("Initializing HNSW index...")
@@ -123,10 +151,15 @@ def main():
     index.set_ef(50)
 
     # ===== SAVE =====
-    index.save_index(INDEX_FILE)
+    # Write to temp files, then swap both in, so a crash mid-save never
+    # leaves a truncated index or an index/texts mismatch.
+    index.save_index(INDEX_FILE + ".tmp")
 
-    with open(TEXTS_FILE, "w", encoding="utf-8") as f:
+    with open(TEXTS_FILE + ".tmp", "w", encoding="utf-8") as f:
         json.dump(texts, f, ensure_ascii=False, indent=2)
+
+    os.replace(INDEX_FILE + ".tmp", INDEX_FILE)
+    os.replace(TEXTS_FILE + ".tmp", TEXTS_FILE)
 
     print("\n==============================")
     print(f"Indexed: {total}")

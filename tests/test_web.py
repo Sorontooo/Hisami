@@ -70,6 +70,21 @@ class UrlExtractTest(unittest.TestCase):
             mem_web.extract_urls("(https://x.example/b)"),
             ["https://x.example/b"])
 
+    def test_balanced_closing_paren_kept(self):
+        # Regression: the ')' closing a '(' inside the URL was stripped.
+        self.assertEqual(
+            mem_web.extract_urls(
+                "see https://en.wikipedia.org/wiki/Mercury_(planet)."),
+            ["https://en.wikipedia.org/wiki/Mercury_(planet)"])
+        self.assertEqual(
+            mem_web.extract_urls(
+                "(https://en.wikipedia.org/wiki/Mercury_(planet))"),
+            ["https://en.wikipedia.org/wiki/Mercury_(planet)"])
+        self.assertEqual(
+            mem_web.extract_urls(
+                "[m](https://en.wikipedia.org/wiki/Mercury_(planet))"),
+            ["https://en.wikipedia.org/wiki/Mercury_(planet)"])
+
     def test_markdown_and_angle_brackets(self):
         self.assertEqual(
             mem_web.extract_urls("[t](https://x.example/c) and <https://y.example/d>"),
@@ -181,6 +196,27 @@ class PromptSourcesTest(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(mem_web.format_prompt_sources(None), "")
         self.assertEqual(mem_web.format_prompt_sources({}), "")
+
+
+class PublicUrlTest(unittest.TestCase):
+    """Literal IPs only — getaddrinfo on a literal does no DNS."""
+
+    def test_blocks_internal_targets(self):
+        for url in ("http://127.0.0.1/", "http://127.0.0.1:11434/api/ps",
+                    "http://10.0.0.5/x", "http://192.168.1.1/",
+                    "http://172.16.0.1/", "http://169.254.169.254/latest",
+                    "http://[::1]/", "http://0.0.0.0/",
+                    "http://[::ffff:127.0.0.1]/", "http://224.0.0.1/"):
+            self.assertFalse(mem_web.is_public_url(url), url)
+
+    def test_allows_public_literal(self):
+        self.assertTrue(mem_web.is_public_url("http://93.184.216.34/page"))
+        self.assertTrue(mem_web.is_public_url("https://1.1.1.1/"))
+
+    def test_bad_input_is_false(self):
+        for url in (None, "", "ftp://93.184.216.34/", "not a url",
+                    "http://", "file:///etc/passwd", "http://[zz]/"):
+            self.assertFalse(mem_web.is_public_url(url), repr(url))
 
 
 if __name__ == "__main__":

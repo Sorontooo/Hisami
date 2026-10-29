@@ -1,7 +1,9 @@
 {
   // This file is JSONC: // and /* */ comments are allowed (see memory/config.py).
   // Replace the two placeholder tokens below with real ones. Never commit
-  // real tokens — keep them in a local copy only.
+  // real tokens — keep them in a local copy only. Alternatively leave the
+  // placeholders and set the DISCORD_TOKEN / OPENROUTER_API_KEY environment
+  // variables, which override these two keys when non-empty.
 
   // Discord bot token (Discord Developer Portal -> Bot -> Token).
   "discord_token": "Put discord token here",
@@ -122,8 +124,8 @@
   // window get a "slow down" nudge instead of a generation.
   "cooldown_seconds": 5,
   // Raw messages kept per channel in the DB (older pruned; summaries keep
-  // the knowledge). Keep above memory_summary_chunk so the background
-  // loop never loses unsummarized messages.
+  // the knowledge). Not-yet-summarized messages are spared (up to 4x this
+  // value) so a lagging or offline summarizer never loses history.
   "memory_prune_keep": 60,
 
   // Local summarizer model (channel summaries + fact extraction).
